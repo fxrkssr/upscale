@@ -21,37 +21,42 @@ HAAR_PATH       = resource_path("haarcascade_frontalface_default.xml")
 BUILTIN_UPSCALE = resource_path("realesrgan_x4.onnx")
 
 
-def _add_cuda_dll_path():
-    """หา CUDA DLLs จาก PyTorch แล้วเพิ่มเข้า search path — ทำงานได้ทั้ง .py และ .exe"""
-    def _try(lib):
-        if os.path.isfile(os.path.join(lib, "cublasLt64_12.dll")):
-            os.add_dll_directory(lib)
-            return True
-        return False
+_CUDA_DLLS = [
+    "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
+    "cudnn64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll",
+    "cudnn_adv64_9.dll", "cudnn_graph64_9.dll", "cudnn_heuristic64_9.dll",
+    "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
+]
 
-    # วิธีที่ 1: import torch ตรงๆ (ใช้ได้เมื่อรันเป็น .py)
+
+def _find_torch_lib() -> str:
+    """หา path ของ torch/lib — ทำงานทั้งใน .py และ .exe"""
+    # วิธี 1: import torch โดยตรง (ใช้ได้ใน .py)
     try:
         import torch as _t
-        if _try(os.path.join(os.path.dirname(_t.__file__), "lib")):
-            return
+        p = os.path.join(os.path.dirname(_t.__file__), "lib")
+        if os.path.isfile(os.path.join(p, "cublasLt64_12.dll")):
+            return p
     except ImportError:
         pass
 
-    # วิธีที่ 2: ถาม system Python ว่า torch อยู่ที่ไหน (ใช้ได้เมื่อรันเป็น .exe)
+    # วิธี 2: ถาม system python (ใช้ได้ใน .exe)
     try:
         import subprocess
         r = subprocess.run(
             ["python", "-c",
              "import torch,os;print(os.path.join(os.path.dirname(torch.__file__),'lib'))"],
             capture_output=True, text=True, timeout=15,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            creationflags=0x08000000,
         )
-        if r.returncode == 0 and _try(r.stdout.strip()):
-            return
+        if r.returncode == 0:
+            p = r.stdout.strip()
+            if os.path.isfile(os.path.join(p, "cublasLt64_12.dll")):
+                return p
     except Exception:
         pass
 
-    # วิธีที่ 3: ค้นหา torch lib ใน AppData (fallback)
+    # วิธี 3: glob search
     import glob
     local = os.environ.get("LOCALAPPDATA", "")
     for pat in [
@@ -60,41 +65,140 @@ def _add_cuda_dll_path():
         r"C:\Python3*\Lib\site-packages\torch\lib",
     ]:
         for p in glob.glob(pat):
-            if _try(p):
-                return
+            if os.path.isfile(os.path.join(p, "cublasLt64_12.dll")):
+                return p
+    return ""
 
 
-# ─── AI Upscaler (ONNX) ────────────────────────────────────────────────────────
+# ─── PyTorch Upscaler (.pth) — GPU รองรับทุกรุ่นรวม Blackwell ─────────────────
 
-class OnnxUpscaler:
-    """โหลด Real-ESRGAN หรือ ONNX SR model ใดก็ได้ (NCHW float32 in/out, range 0-1)"""
+class TorchUpscaler:
+    """โหลด Real-ESRGAN .pth ด้วย PyTorch — GPU sm_120 (RTX 50xx) ทำงานได้"""
 
     def __init__(self, model_path):
-        _add_cuda_dll_path()
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        self._torch = torch
+        self._nn = nn
+        self._F  = F
+        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = "CUDA" if self._dev.type == "cuda" else "CPU"
+        self._scale = 4
+        self._model = self._load(model_path)
+
+    def _load(self, path):
+        torch = self._torch
+        nn    = self._nn
+
+        class RDB(nn.Module):
+            def __init__(self, nf=64, gc=32):
+                super().__init__()
+                self.c = nn.ModuleList([
+                    nn.Conv2d(nf + i*gc, gc if i < 4 else nf, 3, 1, 1) for i in range(5)])
+                self.act = nn.LeakyReLU(0.2, True)
+            def forward(self, x):
+                feats = [x]
+                for i, conv in enumerate(self.c):
+                    o = (self.act if i < 4 else lambda v: v)(conv(torch.cat(feats, 1)))
+                    feats.append(o)
+                return feats[-1] * 0.2 + x
+
+        class RRDB(nn.Module):
+            def __init__(self, nf=64, gc=32):
+                super().__init__()
+                self.b = nn.Sequential(RDB(nf,gc), RDB(nf,gc), RDB(nf,gc))
+            def forward(self, x):
+                return self.b(x) * 0.2 + x
+
+        class Net(nn.Module):
+            def __init__(self, nf=64, nb=23, gc=32):
+                super().__init__()
+                self.cf  = nn.Conv2d(3, nf, 3, 1, 1)
+                self.body = nn.Sequential(*[RRDB(nf,gc) for _ in range(nb)])
+                self.cb  = nn.Conv2d(nf, nf, 3, 1, 1)
+                self.u1  = nn.Conv2d(nf, nf, 3, 1, 1)
+                self.u2  = nn.Conv2d(nf, nf, 3, 1, 1)
+                self.hr  = nn.Conv2d(nf, nf, 3, 1, 1)
+                self.out = nn.Conv2d(nf, 3, 3, 1, 1)
+                self.act = nn.LeakyReLU(0.2, True)
+            def forward(self, x):
+                f = self.cf(x)
+                f = f + self.cb(self.body(f))
+                f = self.act(self.u1(torch.nn.functional.interpolate(f, scale_factor=2, mode="nearest")))
+                f = self.act(self.u2(torch.nn.functional.interpolate(f, scale_factor=2, mode="nearest")))
+                return self.out(self.act(self.hr(f)))
+
+        sd = torch.load(path, map_location="cpu", weights_only=True)
+        if "params_ema" in sd: sd = sd["params_ema"]
+        elif "params"  in sd: sd = sd["params"]
+        net = Net()
+        net.load_state_dict(sd, strict=True)
+        net.eval()
+        return net.to(self._dev)
+
+    @property
+    def scale(self):
+        return self._scale
+
+    @torch.inference_mode()
+    def _infer(self, img_rgb: np.ndarray) -> np.ndarray:
+        torch = self._torch
+        x = torch.from_numpy(img_rgb).float().div(255).permute(2,0,1).unsqueeze(0).to(self._dev)
+        y = self._model(x).squeeze(0).permute(1,2,0).clamp(0,1).mul(255)
+        return y.cpu().numpy().astype(np.uint8)
+
+    def upscale(self, img_bgr, tile=512, pad=16):
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        h, w    = img_rgb.shape[:2]
+        out_rgb = self._infer(img_rgb) if max(h,w) <= tile else self._tiled(img_rgb, tile, pad)
+        return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+
+    def _tiled(self, img_rgb, tile, pad):
+        h, w = img_rgb.shape[:2]; s = self._scale
+        out  = np.zeros((h*s, w*s, 3), dtype=np.uint8)
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                y1,x1 = max(0,y-pad), max(0,x-pad)
+                y2,x2 = min(h,y+tile+pad), min(w,x+tile+pad)
+                to = self._infer(img_rgb[y1:y2, x1:x2])
+                oy1,ox1 = (y-y1)*s, (x-x1)*s
+                oy2 = oy1 + min(tile, h-y)*s
+                ox2 = ox1 + min(tile, w-x)*s
+                dy1,dx1 = y*s, x*s
+                out[dy1:dy1+(oy2-oy1), dx1:dx1+(ox2-ox1)] = to[oy1:oy2, ox1:ox2]
+        return out
+
+
+# ─── ONNX Upscaler (.onnx) — CPU fallback ─────────────────────────────────────
+
+class OnnxUpscaler:
+    """โหลด .onnx ด้วย onnxruntime — CPU เป็นหลัก (GPU ขึ้นอยู่กับ onnxruntime version)"""
+
+    def __init__(self, model_path):
         import onnxruntime as ort
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self._sess = ort.InferenceSession(model_path, providers=providers)
+        self._sess = ort.InferenceSession(model_path,
+                                          providers=["CUDAExecutionProvider",
+                                                     "CPUExecutionProvider"])
         self.device = self._sess.get_providers()[0].replace("ExecutionProvider", "")
-        self._inp  = self._sess.get_inputs()[0].name
-        self._out  = self._sess.get_outputs()[0].name
+        self._inp   = self._sess.get_inputs()[0].name
+        self._out   = self._sess.get_outputs()[0].name
         self._scale = self._detect_scale()
 
     def _detect_scale(self):
         probe = np.zeros((1, 3, 16, 16), dtype=np.float32)
-        out   = self._sess.run([self._out], {self._inp: probe})[0]
-        return out.shape[2] // 16  # e.g. 64//16 = 4
+        return self._sess.run([self._out], {self._inp: probe})[0].shape[2] // 16
 
     @property
     def scale(self):
         return self._scale
 
     def _infer(self, img_rgb: np.ndarray) -> np.ndarray:
-        """img_rgb: HxWx3 uint8  →  upscaled HxWx3 uint8"""
         x = img_rgb.astype(np.float32) / 255.0
-        x = np.transpose(x, (2, 0, 1))[None]          # NCHW
+        x = np.transpose(x, (2,0,1))[None]
         y = self._sess.run([self._out], {self._inp: x})[0]
-        y = np.squeeze(y, 0).transpose(1, 2, 0)       # HWC
-        return np.clip(y * 255, 0, 255).astype(np.uint8)
+        y = np.squeeze(y, 0).transpose(1,2,0)
+        return np.clip(y*255, 0, 255).astype(np.uint8)
 
     def upscale(self, img_bgr: np.ndarray, tile: int = 512, pad: int = 16) -> np.ndarray:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -142,8 +246,9 @@ class App(tk.Tk):
         self.title("Face Cropper — AI Training Dataset")
         self.geometry("720x680")
         self.minsize(640, 560)
-        self._running  = False
-        self._upscaler = None   # cache โมเดลตลอด session
+        self._running      = False
+        self._upscaler     = None   # cache โมเดลตลอด session
+        self._upscaler_key = None   # path ของโมเดลที่โหลดอยู่
         self._build()
 
     # ─── UI ────────────────────────────────────────────────────────────────────
@@ -192,7 +297,7 @@ class App(tk.Tk):
         ttk.Entry(r2, textvariable=self.v_q, width=4).pack(side="left", padx=4)
 
         # ── AI Upscale ─────────────────────────────────────────────────────────
-        fu = ttk.LabelFrame(self, text=" AI Upscale (Real-ESRGAN / ONNX) ")
+        fu = ttk.LabelFrame(self, text=" AI Upscale (Real-ESRGAN) ")
         fu.pack(fill="x", **pad)
 
         u1 = ttk.Frame(fu)
@@ -208,7 +313,7 @@ class App(tk.Tk):
 
         u2 = ttk.Frame(fu)
         u2.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(u2, text="ONNX model:").pack(side="left")
+        ttk.Label(u2, text="Model:").pack(side="left")
         # ถ้ามีโมเดลฝังมากับ exe ให้แสดงชื่อเลย
         default_model = BUILTIN_UPSCALE if os.path.exists(BUILTIN_UPSCALE) else ""
         self.v_up_model = tk.StringVar(value=default_model)
@@ -219,10 +324,11 @@ class App(tk.Tk):
         self.btn_up_browse.pack(side="left")
 
         if os.path.exists(BUILTIN_UPSCALE):
-            hint_txt = "  ✓ Real-ESRGAN x4 ฝังมากับโปรแกรมแล้ว (หรือ Browse เลือก model อื่น)"
+            hint_txt = ("  ✓ Real-ESRGAN x4 ฝังมาแล้ว (CPU)  —  Browse เลือก .pth"
+                        " เพื่อใช้ GPU (ต้องติดตั้ง PyTorch+CUDA)")
             hint_color = "#7ecf7e"
         else:
-            hint_txt = "  ดาวน์โหลดโมเดล: openmodeldb.info → Real-ESRGAN x4"
+            hint_txt = "  .pth = GPU (PyTorch)  |  .onnx = CPU (ONNX Runtime)"
             hint_color = "#888"
         ttk.Label(fu, text=hint_txt, foreground=hint_color, font=("", 8)
                   ).pack(anchor="w", padx=8, pady=(0, 4))
@@ -274,12 +380,18 @@ class App(tk.Tk):
 
     def _browse_model(self):
         f = filedialog.askopenfilename(
-            title="เลือก ONNX model",
-            filetypes=[("ONNX model", "*.onnx"), ("All files", "*.*")]
+            title="เลือก model (.pth = GPU / .onnx = CPU)",
+            filetypes=[
+                ("Model files", "*.pth *.onnx"),
+                ("PyTorch model (GPU)", "*.pth"),
+                ("ONNX model (CPU)", "*.onnx"),
+                ("All files", "*.*"),
+            ]
         )
         if f:
             self.v_up_model.set(f)
-            self._upscaler = None  # reset cache เมื่อเปลี่ยนโมเดล
+            self._upscaler     = None
+            self._upscaler_key = None
 
     def _log(self, msg, color=None):
         self.log.configure(state="normal")
@@ -395,9 +507,15 @@ class App(tk.Tk):
             # ── AI Upscaler ────────────────────────────────────
             upscaler = None
             if use_up:
-                if self._upscaler is None:
-                    log("กำลังโหลด ONNX upscale model…", "#a0c8ff")
-                    self._upscaler = OnnxUpscaler(up_model_path)
+                if self._upscaler is None or self._upscaler_key != up_model_path:
+                    is_pth = up_model_path.lower().endswith(".pth")
+                    if is_pth:
+                        log("กำลังโหลด PyTorch model (GPU)…", "#a0c8ff")
+                        self._upscaler = TorchUpscaler(up_model_path)
+                    else:
+                        log("กำลังโหลด ONNX upscale model…", "#a0c8ff")
+                        self._upscaler = OnnxUpscaler(up_model_path)
+                    self._upscaler_key = up_model_path
                 upscaler = self._upscaler
                 log(f"Upscaler: {Path(up_model_path).name}  "
                     f"x{upscaler.scale}  [{upscaler.device}]", "#7ecf7e")
