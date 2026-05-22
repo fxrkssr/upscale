@@ -129,7 +129,7 @@ class TorchUpscaler:
                 f = self.act(self.u2(torch.nn.functional.interpolate(f, scale_factor=2, mode="nearest")))
                 return self.out(self.act(self.hr(f)))
 
-        sd = torch.load(path, map_location="cpu", weights_only=True)
+        sd = torch.load(path, map_location="cpu", weights_only=False)
         if "params_ema" in sd: sd = sd["params_ema"]
         elif "params"  in sd: sd = sd["params"]
         net = Net()
@@ -611,7 +611,8 @@ class App(tk.Tk):
 
         except Exception:
             import traceback
-            self.after(0, lambda: self._log(traceback.format_exc(), "#ff7070"))
+            tb = traceback.format_exc()
+            self.after(0, lambda: self._log(tb, "#ff7070"))
         finally:
             self._running = False
             self.after(0, lambda: self.btn_start.configure(state="normal"))
