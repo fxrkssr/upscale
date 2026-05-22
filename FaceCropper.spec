@@ -1,29 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os, sys
+import os
+from PyInstaller.utils.hooks import collect_all
 
 ORT_DIR = r"C:\Users\KssR\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\onnxruntime"
 CV2_DIR = r"C:\Users\KssR\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\cv2"
 
+# รวม torch ทั้งหมด (Python files + CUDA DLLs)
+torch_datas, torch_binaries, torch_hiddenimports = collect_all('torch')
+
 binaries = [
-    # onnxruntime DLLs (CPU + GPU)
-    (os.path.join(ORT_DIR, "capi", "onnxruntime.dll"),                   "onnxruntime/capi"),
-    (os.path.join(ORT_DIR, "capi", "onnxruntime_providers_shared.dll"),  "onnxruntime/capi"),
-    (os.path.join(ORT_DIR, "capi", "onnxruntime_providers_cuda.dll"),    "onnxruntime/capi"),
-    (os.path.join(ORT_DIR, "capi", "onnxruntime_providers_tensorrt.dll"),"onnxruntime/capi"),
-    # cv2 pyd + ffmpeg dll
+    (os.path.join(ORT_DIR, "capi", "onnxruntime.dll"),                  "onnxruntime/capi"),
+    (os.path.join(ORT_DIR, "capi", "onnxruntime_providers_shared.dll"), "onnxruntime/capi"),
+    (os.path.join(ORT_DIR, "capi", "onnxruntime_providers_cuda.dll"),   "onnxruntime/capi"),
     (os.path.join(CV2_DIR, "cv2.pyd"),                                   "cv2"),
     (os.path.join(CV2_DIR, "opencv_videoio_ffmpeg4130_64.dll"),          "cv2"),
-]
+] + torch_binaries
 
 datas = [
-    ("face_detection_yunet_2023mar.onnx",      "."),
-    ("haarcascade_frontalface_default.xml",    "."),
-    ("realesrgan_x4.onnx",                    "."),   # AI upscale model
-    # cv2 data folder (haarcascades built-in path)
-    (os.path.join(CV2_DIR, "data"),            "cv2/data"),
-    # onnxruntime python files
-    (ORT_DIR, "onnxruntime"),
-]
+    ("face_detection_yunet_2023mar.onnx",   "."),
+    ("haarcascade_frontalface_default.xml", "."),
+    (r"D:\Downloads\RealESRGAN_x4plus.pth", "."),   # GPU model (TorchUpscaler)
+    ("realesrgan_x4.onnx",                  "."),   # CPU fallback (OnnxUpscaler)
+    (os.path.join(CV2_DIR, "data"),          "cv2/data"),
+    (ORT_DIR,                                "onnxruntime"),
+] + torch_datas
 
 a = Analysis(
     ["face_cropper_gui.py"],
@@ -36,11 +36,14 @@ a = Analysis(
         "onnxruntime.capi",
         "onnxruntime.capi.onnxruntime_inference_collection",
         "cv2",
-    ],
+        "torch",
+        "torch.nn",
+        "torch.nn.functional",
+    ] + torch_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["torch", "tensorflow", "matplotlib", "scipy", "pandas"],
+    excludes=["tensorflow", "matplotlib", "scipy", "pandas"],
     noarchive=False,
 )
 
