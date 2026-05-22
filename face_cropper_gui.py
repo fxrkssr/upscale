@@ -141,12 +141,12 @@ class TorchUpscaler:
     def scale(self):
         return self._scale
 
-    @torch.inference_mode()
     def _infer(self, img_rgb: np.ndarray) -> np.ndarray:
         torch = self._torch
-        x = torch.from_numpy(img_rgb).float().div(255).permute(2,0,1).unsqueeze(0).to(self._dev)
-        y = self._model(x).squeeze(0).permute(1,2,0).clamp(0,1).mul(255)
-        return y.cpu().numpy().astype(np.uint8)
+        with torch.inference_mode():
+            x = torch.from_numpy(img_rgb).float().div(255).permute(2,0,1).unsqueeze(0).to(self._dev)
+            y = self._model(x).squeeze(0).permute(1,2,0).clamp(0,1).mul(255)
+            return y.cpu().numpy().astype(np.uint8)
 
     def upscale(self, img_bgr, tile=512, pad=16):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
