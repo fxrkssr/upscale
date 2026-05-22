@@ -27,8 +27,16 @@ class OnnxUpscaler:
     """โหลด Real-ESRGAN หรือ ONNX SR model ใดก็ได้ (NCHW float32 in/out, range 0-1)"""
 
     def __init__(self, model_path):
+        # ใช้ CUDA DLLs ที่ bundled มากับ PyTorch เพื่อให้ onnxruntime-gpu หาเจอ
+        try:
+            import torch as _t
+            _lib = os.path.join(os.path.dirname(_t.__file__), "lib")
+            if os.path.isdir(_lib):
+                os.add_dll_directory(_lib)
+        except ImportError:
+            pass
+
         import onnxruntime as ort
-        # ลอง GPU ก่อน ถ้าไม่มี CUDA ก็ fallback CPU อัตโนมัติ
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self._sess = ort.InferenceSession(model_path, providers=providers)
         self.device = self._sess.get_providers()[0].replace("ExecutionProvider", "")
