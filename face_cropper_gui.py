@@ -16,9 +16,52 @@ def resource_path(rel):
     return os.path.join(base, rel)
 
 
-FACE_MODEL    = resource_path("face_detection_yunet_2023mar.onnx")
-HAAR_PATH     = resource_path("haarcascade_frontalface_default.xml")
-BUILTIN_UPSCALE = resource_path("realesrgan_x4.onnx")   # ฝังมากับ exe
+FACE_MODEL      = resource_path("face_detection_yunet_2023mar.onnx")
+HAAR_PATH       = resource_path("haarcascade_frontalface_default.xml")
+BUILTIN_UPSCALE = resource_path("realesrgan_x4.onnx")
+
+
+def _add_cuda_dll_path():
+    """หา CUDA DLLs จาก PyTorch แล้วเพิ่มเข้า search path — ทำงานได้ทั้ง .py และ .exe"""
+    def _try(lib):
+        if os.path.isfile(os.path.join(lib, "cublasLt64_12.dll")):
+            os.add_dll_directory(lib)
+            return True
+        return False
+
+    # วิธีที่ 1: import torch ตรงๆ (ใช้ได้เมื่อรันเป็น .py)
+    try:
+        import torch as _t
+        if _try(os.path.join(os.path.dirname(_t.__file__), "lib")):
+            return
+    except ImportError:
+        pass
+
+    # วิธีที่ 2: ถาม system Python ว่า torch อยู่ที่ไหน (ใช้ได้เมื่อรันเป็น .exe)
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["python", "-c",
+             "import torch,os;print(os.path.join(os.path.dirname(torch.__file__),'lib'))"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+        if r.returncode == 0 and _try(r.stdout.strip()):
+            return
+    except Exception:
+        pass
+
+    # วิธีที่ 3: ค้นหา torch lib ใน AppData (fallback)
+    import glob
+    local = os.environ.get("LOCALAPPDATA", "")
+    for pat in [
+        os.path.join(local, "Python", "*", "Lib", "site-packages", "torch", "lib"),
+        os.path.join(local, "Programs", "Python", "*", "Lib", "site-packages", "torch", "lib"),
+        r"C:\Python3*\Lib\site-packages\torch\lib",
+    ]:
+        for p in glob.glob(pat):
+            if _try(p):
+                return
 
 
 # ─── AI Upscaler (ONNX) ────────────────────────────────────────────────────────
@@ -27,15 +70,7 @@ class OnnxUpscaler:
     """โหลด Real-ESRGAN หรือ ONNX SR model ใดก็ได้ (NCHW float32 in/out, range 0-1)"""
 
     def __init__(self, model_path):
-        # ใช้ CUDA DLLs ที่ bundled มากับ PyTorch เพื่อให้ onnxruntime-gpu หาเจอ
-        try:
-            import torch as _t
-            _lib = os.path.join(os.path.dirname(_t.__file__), "lib")
-            if os.path.isdir(_lib):
-                os.add_dll_directory(_lib)
-        except ImportError:
-            pass
-
+        _add_cuda_dll_path()
         import onnxruntime as ort
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self._sess = ort.InferenceSession(model_path, providers=providers)
