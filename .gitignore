@@ -1,0 +1,26 @@
+# training images
+*.jpg
+*.jpeg
+*.png
+*.JPG
+*.JPEG
+*.PNG
+*.webp
+*.bmp
+
+# model files (ขนาดใหญ่ — generate เองจาก convert_pth_to_onnx.py)
+*.onnx
+*.xml
+*.pth
+
+# build artifacts
+build/
+dist/
+__pycache__/
+*.spec.bak
+
+# output
+faces_*/
+
+# claude
+.claude/
