@@ -18,7 +18,10 @@ def resource_path(rel):
 
 FACE_MODEL      = resource_path("face_detection_yunet_2023mar.onnx")
 HAAR_PATH       = resource_path("haarcascade_frontalface_default.xml")
-BUILTIN_UPSCALE = resource_path("realesrgan_x4.onnx")
+# ใช้ .pth (GPU) ถ้ามี ไม่งั้น fallback .onnx (CPU)
+_PTH  = resource_path("RealESRGAN_x4plus.pth")
+_ONNX = resource_path("realesrgan_x4.onnx")
+BUILTIN_UPSCALE = _PTH if os.path.exists(_PTH) else _ONNX
 
 
 _CUDA_DLLS = [
@@ -332,12 +335,14 @@ class App(tk.Tk):
                                         command=self._browse_model, state="disabled")
         self.btn_up_browse.pack(side="left")
 
-        if os.path.exists(BUILTIN_UPSCALE):
-            hint_txt = ("  ✓ Real-ESRGAN x4 ฝังมาแล้ว (CPU)  —  Browse เลือก .pth"
-                        " เพื่อใช้ GPU (ต้องติดตั้ง PyTorch+CUDA)")
+        if os.path.exists(_PTH):
+            hint_txt   = "  ✓ Real-ESRGAN x4 (GPU — PyTorch CUDA) ฝังมาแล้ว"
             hint_color = "#7ecf7e"
+        elif os.path.exists(_ONNX):
+            hint_txt   = "  ✓ Real-ESRGAN x4 (CPU — ONNX) ฝังมาแล้ว  |  Browse .pth เพื่อ GPU"
+            hint_color = "#f0c040"
         else:
-            hint_txt = "  .pth = GPU (PyTorch)  |  .onnx = CPU (ONNX Runtime)"
+            hint_txt   = "  .pth = GPU (PyTorch)  |  .onnx = CPU (ONNX Runtime)"
             hint_color = "#888"
         ttk.Label(fu, text=hint_txt, foreground=hint_color, font=("", 8)
                   ).pack(anchor="w", padx=8, pady=(0, 4))
